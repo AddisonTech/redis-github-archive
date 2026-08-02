@@ -1,88 +1,126 @@
 """
 crud_operations.py
-OWNER: Person 2
 
-Purpose: Give the user a menu-driven way to Create, Read, Update, and
-Delete event records in Redis. This is worth the most points under
-"Functionality" in the rubric, so make sure every option actually works
-against real data, not just placeholder text.
-
-Depends on the schema Person 1 defines in data_loader.py. Talk to them
-before writing this so your key names match.
-
-TODO:
-    - Fill in each CRUD function below using the schema from data_loader.py
-    - Build out run_crud_menu() so a user can pick an option and see
-      the result printed clearly
-    - Add input validation so bad input doesn't crash the program
+CRUD operations on commit records stored in Redis by data_loader.py.
+Each commit is identified by its Git commit hash.
 """
 
+import json
 from redis_config import get_redis_connection
 
 
-def create_record(r, event_id, fields):
+def create_record(r, commit_hash, repo_name, author_name, subject, message=""):
     """
-    Adds a new event record to Redis.
-    fields should be a dictionary of field name -> value pairs.
-
-    TODO: implement using r.hset(f"event:{event_id}", mapping=fields)
-    and update any relevant index sets.
+    Adds a new commit record to Redis, indexed the same way
+    data_loader.py indexes loaded commits so it behaves consistently
+    with the rest of the data.
     """
-    pass
+    key = f"commit:{commit_hash}"
+    r.hset(key, mapping={
+        "repo_name": repo_name,
+        "author_name": author_name,
+        "author_email": "",
+        "committer_name": author_name,
+        "subject": subject,
+        "message": message,
+        "tree": "",
+        "files_changed": json.dumps([]),
+        "num_files_changed": 0,
+    })
+    r.sadd(f"commits:by_repo:{repo_name}", commit_hash)
+    r.zincrby(f"commits:by_author:{repo_name}", 1, author_name)
+    r.sadd("repos:loaded", repo_name)
+    return key
 
 
-def read_record(r, event_id):
+def read_record(r, commit_hash):
     """
-    Retrieves and returns one event record by its id.
-
-    TODO: implement using r.hgetall(f"event:{event_id}")
-    Return None (or a clear message) if the record doesn't exist.
+    Retrieves one commit record. Returns None if it doesn't exist.
     """
-    pass
+    key = f"commit:{commit_hash}"
+    if not r.exists(key):
+        return None
+    return r.hgetall(key)
 
 
-def update_record(r, event_id, fields):
+def update_record(r, commit_hash, fields):
     """
-    Updates one or more fields on an existing event record.
-    fields should be a dictionary of field name -> new value.
-
-    TODO: implement using r.hset(). Check the record exists first
-    with r.exists() and handle the case where it doesn't.
+    Updates one or more fields on an existing commit record. fields is
+    a dictionary, for example {"subject": "new subject"}. Returns False
+    if the record doesn't exist.
     """
-    pass
+    key = f"commit:{commit_hash}"
+    if not r.exists(key):
+        return False
+    r.hset(key, mapping=fields)
+    return True
 
 
-def delete_record(r, event_id):
+def delete_record(r, commit_hash):
     """
-    Removes an event record from Redis, including cleaning it out of
-    any index sets it was added to in data_loader.py.
-
-    TODO: implement using r.delete() and r.srem() as needed.
+    Removes a commit record and cleans it out of the repo and author
+    indexes it was added to. Returns False if it didn't exist.
     """
-    pass
+    key = f"commit:{commit_hash}"
+    record = r.hgetall(key)
+    if not record:
+        return False
+
+    repo_name = record.get("repo_name")
+    author_name = record.get("author_name")
+
+    r.delete(key)
+    if repo_name:
+        r.srem(f"commits:by_repo:{repo_name}", commit_hash)
+        if author_name:
+            r.zincrby(f"commits:by_author:{repo_name}", -1, author_name)
+    return True
 
 
 def run_crud_menu():
     """
-    Displays a text menu (Create / Read / Update / Delete / Quit) in a
-    loop, takes user input, and calls the matching function above.
-    This is the function main.py will call.
-
-    TODO: build out the loop and menu prompts.
+    Text menu that exercises all four CRUD operations against the
+    commit data in Redis.
     """
     r = get_redis_connection()
+
     while True:
         print("\n1. Create  2. Read  3. Update  4. Delete  5. Back to Main Menu")
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
-            pass  # TODO: gather input, call create_record()
+            commit_hash = input("New commit hash (any unique string): ").strip()
+            repo_name = input("Repo name: ").strip()
+            author_name = input("Author name: ").strip()
+            subject = input("Commit subject: ").strip()
+            create_record(r, commit_hash, repo_name, author_name, subject)
+            print("Commit created.")
+
         elif choice == "2":
-            pass  # TODO: gather input, call read_record()
+            commit_hash = input("Commit hash to look up: ").strip()
+            record = read_record(r, commit_hash)
+            if record:
+                for field, value in record.items():
+                    print(f"  {field}: {value}")
+            else:
+                print("No commit found with that hash.")
+
         elif choice == "3":
-            pass  # TODO: gather input, call update_record()
+            commit_hash = input("Commit hash to update: ").strip()
+            field = input("Field to update (e.g. subject): ").strip()
+            value = input("New value: ").strip()
+            if update_record(r, commit_hash, {field: value}):
+                print("Commit updated.")
+            else:
+                print("No commit found with that hash.")
+
         elif choice == "4":
-            pass  # TODO: gather input, call delete_record()
+            commit_hash = input("Commit hash to delete: ").strip()
+            if delete_record(r, commit_hash):
+                print("Commit deleted.")
+            else:
+                print("No commit found with that hash.")
+
         elif choice == "5":
             break
         else:
@@ -90,5 +128,4 @@ def run_crud_menu():
 
 
 if __name__ == "__main__":
-    # Lets Person 2 test this file on its own without running main.py
     run_crud_menu()

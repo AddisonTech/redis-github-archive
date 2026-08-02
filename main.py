@@ -1,26 +1,16 @@
 """
 main.py
-OWNER: Person 4 (integration)
 
-Purpose: This is the single entry point for the application. It ties
-together data loading, CRUD operations, and both features into one
-menu-driven program, which is what gets demonstrated in the video and
-graded as "the application."
-
-Do not write feature logic here. This file should only import and
-call functions from the other four modules. If a menu option isn't
-working, the bug almost always belongs in the module that owns it.
-
-TODO:
-    - Once data_loader.py, crud_operations.py, and both feature files
-      are working on their own, wire them together below.
-    - Test the full menu flow end to end before recording the video.
+Entry point for the GitHub Archive Redis application. Ties together
+data loading, CRUD operations, and the three features into one
+menu-driven program.
 """
 
 from data_loader import load_all_data
 from crud_operations import run_crud_menu
 from feature_language_stats import print_language_report
-from feature_commit_viz import show_commit_history
+from feature_license_stats import print_license_report
+from feature_commit_activity import show_commit_activity, list_available_repos
 
 
 def main():
@@ -29,9 +19,10 @@ def main():
     while True:
         print("\n1. Load data into Redis")
         print("2. CRUD operations")
-        print("3. Feature: Language/technology popularity")
-        print("4. Feature: Commit history visualization")
-        print("5. Quit")
+        print("3. Feature: Language popularity")
+        print("4. Feature: Commit activity by repo")
+        print("5. Feature: License popularity")
+        print("6. Quit")
 
         choice = input("Choose an option: ").strip()
 
@@ -42,8 +33,14 @@ def main():
         elif choice == "3":
             print_language_report()
         elif choice == "4":
-            show_commit_history()
+            repos = list_available_repos()
+            print("Available repos:", ", ".join(repos) if repos else "none loaded yet")
+            if repos:
+                repo_choice = input("Enter a repo name from the list above: ").strip()
+                show_commit_activity(repo_choice)
         elif choice == "5":
+            print_license_report()
+        elif choice == "6":
             print("Goodbye.")
             break
         else:

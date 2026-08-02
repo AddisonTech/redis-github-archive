@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset JSON files, several hundred MB. Never commit these.
+data/
