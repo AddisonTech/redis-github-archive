@@ -1,15 +1,21 @@
-# GitHub Archive Redis Integration
+# GitHub Archive Database Integration
 
-A Python application that loads real GitHub commit, language, and
-license data into Redis and performs CRUD operations and analysis on
-it.
+A Python application that loads real GitHub Archive data into a database
+and performs CRUD operations and analysis on it.
+
+The project is built in parts. Part 1 implemented the application
+against **Redis**, a key-value store. Part 2 implements comparable
+functionality against **MongoDB**, a document store. Both are included
+so the two approaches can be run and compared side by side.
 
 ## Dependencies
 - Python 3.10 or later
-- Redis server (running locally or accessible remotely)
+- MongoDB server (for the MongoDB section)
+- Redis server (for the Redis section)
+- pymongo (`pip install pymongo`)
 - redis-py (`pip install redis`)
-- matplotlib, only needed if you switch the commit activity feature
-  from text bars to an actual chart
+- matplotlib (`pip install matplotlib`), required by the Redis commit
+  activity feature, which renders a bar chart of top contributors
 
 Install everything at once with:
 ```
@@ -17,79 +23,136 @@ pip install -r requirements.txt
 ```
 
 ## Technology Requirements
-- A running Redis instance.
-- The dataset files, placed in a `data/` folder in the project root:
-  `Sample_Commits.json`, `Languages.json`, `Licenses.json`
+- A running MongoDB instance on localhost:27017
+- A running Redis instance on localhost:6379
+- Dataset files placed in a `data/` folder in the project root:
+  `Sample_Commits.json`, `Sample_Repos.json`, `Licenses.json`,
+  `Languages.json`
 
-Note: the dataset files are not committed to this repository. They're
-several hundred megabytes combined, which exceeds GitHub's per-file
-size limits and isn't something you want tracked in version control
-anyway. Only the code is pushed; the `data/` folder is listed in
-`.gitignore`.
+The dataset files are not committed to this repository. They are
+several hundred megabytes combined, which exceeds GitHub's file size
+limits. The `data/` folder is listed in `.gitignore`.
 
 ## Setup
 1. Clone this repository.
 2. Install dependencies: `pip install -r requirements.txt`
-3. Make sure your Redis server is running.
-4. Create a `data/` folder in the project root and place
-   `Sample_Commits.json`, `Languages.json`, and `Licenses.json` inside
-   it.
+3. Start MongoDB and/or Redis depending on which section you plan to use.
+4. Create a `data/` folder in the project root and place the dataset
+   files inside it.
 5. Run the application: `python main.py`
-6. From the menu, choose option 1 to load data into Redis before using
-   any CRUD or feature options. The language file has a few million
-   lines, so this step can take a couple of minutes; progress prints
-   let you know it's still working.
+6. Choose a database, then choose option 1 to load data before using
+   CRUD or any feature. Every other option reads from what the load
+   step creates.
 
 ## Project Structure
 ```
 redis-github-archive/
-├── main.py                      # Entry point and menu, ties everything together
-├── redis_config.py              # Shared Redis connection setup
-├── data_loader.py                # Reads the dataset files and loads them into Redis
-├── crud_operations.py            # Create, Read, Update, Delete on commit records
-├── feature_language_stats.py     # Feature 1: language popularity by total bytes
-├── feature_commit_activity.py    # Feature 2: commit activity by author, per repo
-├── feature_license_stats.py      # Feature 3: license popularity by repo count
+├── main.py                         # Entry point, database selection menu
+│
+├── mongo_config.py                 # MongoDB connection settings
+├── mongo_data_loader.py            # Loads dataset into MongoDB collections
+├── mongo_crud.py                   # CRUD on commit documents
+├── feature_commit_words.py         # MongoDB feature 1
+├── feature_watch_distribution.py   # MongoDB feature 2
+├── feature_repo_names.py           # MongoDB feature 3
+│
+├── redis_config.py                 # Redis connection settings
+├── data_loader.py                  # Loads dataset into Redis
+├── crud_operations.py              # CRUD on commit records
+├── feature_language_stats.py       # Redis feature 1
+├── feature_commit_activity.py      # Redis feature 2
+├── feature_license_stats.py        # Redis feature 3
+│
 └── requirements.txt
 ```
 
-## Data Source and Design Decisions
-This project uses three of the provided dataset files:
-- `Sample_Commits.json`, real commit records (with file-change data)
-  for six well-known repositories: torvalds/linux, apple/swift,
-  twbs/bootstrap, facebook/react, Microsoft/vscode, and
-  tensorflow/tensorflow. This is the CRUD entity.
-- `Languages.json`, aggregated into a total-bytes-per-language
-  leaderboard.
-- `Licenses.json`, aggregated into a repo-count-per-license
-  leaderboard.
+## MongoDB Section (Part 2)
 
-`Files.json` and `Contents.json` were left out. Their repo names
-barely overlap with the other files (each is an independent random
-sample from the course dataset), and `Contents.json` alone is
-hundreds of megabytes of raw file text that none of the three
-features need.
+### Collections
+```
+commits    one document per commit, _id is the commit hash
+           indexed on repo_name and author_name
+repos      one document per repository with watch_count and name_length
+           indexed on watch_count (descending) and name_length
+licenses   one document per repository with its license
+           indexed on license
+```
 
-The dataset has no commit timestamps, so "commit history" is
-represented as commit activity by author rather than activity over
-time.
+### CRUD Operations
+Create, Read, Update, and Delete on individual commit documents, keyed
+by commit hash. Also includes a case-insensitive author search using a
+regular expression query, which has no direct Redis equivalent without
+building a dedicated index structure for it.
 
-## Redis Schema
+### Features
+1. **Common words in commit messages.** An aggregation pipeline that
+   lowercases each subject line, splits it into words with `$split`,
+   flattens the result with `$unwind`, filters out stop words, then
+   groups and sorts by frequency. All processing happens on the
+   database server.
+2. **Repository distribution by watch count.** Uses the `$bucket`
+   aggregation stage to sort repositories into watch count ranges and
+   count them, producing a histogram. Also lists the most watched
+   repositories using the descending index on `watch_count`.
+3. **Repository name analysis.** Reports average, minimum, and maximum
+   repository name length using a `$group` aggregation with `$avg`,
+   `$min`, and `$max`, then lists the longest and shortest repository
+   names using the indexed `name_length` field.
+
+## Redis Section (Part 1)
+
+### Schema
 ```
 commit:<commit_hash>              Hash        full commit record
 commits:by_repo:<repo_name>       Set         commit hashes for that repo
 commits:by_author:<repo_name>     Sorted Set  author name -> commit count
 repos:loaded                      Set         every repo_name with commits loaded
-
 languages:ranked                  Sorted Set  language name -> total bytes
 licenses:ranked                   Sorted Set  license name -> repo count
 ```
 
-## Current Features
-1. CRUD operations on commit records
-2. Language popularity across the full dataset, ranked by total bytes
-3. Commit activity by author, for any of the six loaded repositories
-4. License popularity across the dataset, ranked by repo count
+### Features
+1. **Language popularity**, ranked by total bytes of code across the
+   dataset, read from a sorted set with `ZREVRANGE`.
+2. **Commit activity by repository**, showing top contributors for any
+   of the six loaded repositories.
+3. **License popularity**, ranked by how many repositories use each
+   license.
+
+## Data Source Notes
+- `Sample_Commits.json` supplies commit records for six well known
+  repositories: torvalds/linux, apple/swift, twbs/bootstrap,
+  facebook/react, Microsoft/vscode, and tensorflow/tensorflow.
+- `Sample_Repos.json` supplies repository names with watch counts.
+- `Licenses.json` supplies one license per repository.
+- `Languages.json` is used only by the Redis section.
+- `Files.json` and `Contents.json` are not used. Their repository names
+  have almost no overlap with the commit data, and `Contents.json` is
+  several hundred megabytes of raw file text that none of the
+  implemented features require.
+- The dataset contains no commit timestamps, so commit history is
+  represented as activity by author rather than activity over time.
+
+## Redis vs MongoDB, Observed Differences
+Building the same application on both databases surfaced some concrete
+trade-offs:
+
+- **Data modeling.** Redis required flattening each commit into a hash
+  and hand-building separate set and sorted-set structures to support
+  lookups. MongoDB stored each JSON record close to its original shape,
+  nested fields included.
+- **Deletes.** Deleting a commit in Redis meant also removing it from
+  its repo set and decrementing its author sorted set, or the indexes
+  would be left with orphaned references. In MongoDB it is a single
+  `delete_one` call.
+- **Analysis.** Redis has no server-side aggregation, so analysis
+  either had to be precomputed during loading or pulled back into
+  Python and tallied there. MongoDB's aggregation pipeline performs
+  grouping, bucketing, and sorting on the server and returns only the
+  finished result.
+- **Querying.** Redis can only look up what it was explicitly indexed
+  for. MongoDB can query inside documents, which is what makes the
+  author search feature possible without extra load-time work.
 
 ## Next Steps
 - (Update this section each week with what's left to do)
