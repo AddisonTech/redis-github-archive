@@ -13,7 +13,6 @@ over time.
 
 from redis_config import get_redis_connection
 
-# Uncomment if you want a real chart instead of the text bar version:
 import matplotlib.pyplot as plt
 
 
@@ -56,7 +55,8 @@ def show_commit_activity(repo_name, top_n=10):
         bar_length = int((count / max_count) * 40) if max_count else 0
         print(f"  {author[:25]:<25} {'#' * bar_length} ({count})")
 
-    # TODO if you want a real chart instead of text bars:
+    # Render the same data as a matplotlib chart so the output is
+    # presentable rather than just ASCII bars.
     names = [d[0] for d in data]
     counts = [d[1] for d in data]
     plt.barh(names, counts)
