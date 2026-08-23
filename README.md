@@ -10,16 +10,19 @@ The project is built in parts, one database per part:
 | 1 | **Redis** | Key-value store |
 | 2 | **MongoDB** | Document store |
 | 3 | **Cassandra** | Column-family store |
+| 4 | **Neo4j** | Graph store |
 
-All three implementations live in the same project so the same
-application can be run against each one and the three data models
+All four implementations live in the same project so the same
+application can be run against each one and the four data models
 compared side by side.
 
 ## Dependencies
 - Python 3.10 or later
+- Neo4j server (for the Neo4j section)
 - Cassandra node (for the Cassandra section)
 - MongoDB server (for the MongoDB section)
 - Redis server (for the Redis section)
+- neo4j (`pip install neo4j`)
 - cassandra-driver (`pip install cassandra-driver`)
 - pymongo (`pip install pymongo`)
 - redis-py (`pip install redis`)
@@ -32,6 +35,7 @@ pip install -r requirements.txt
 ```
 
 ## Technology Requirements
+- A running Neo4j server on bolt://localhost:7687
 - A running Cassandra node on 127.0.0.1:9042
 - A running MongoDB instance on localhost:27017
 - A running Redis instance on localhost:6379
@@ -46,26 +50,38 @@ limits. The `data/` folder is listed in `.gitignore`.
 ## Setup
 1. Clone this repository.
 2. Install dependencies: `pip install -r requirements.txt`
-3. Start Cassandra, MongoDB, and/or Redis depending on which section
-   you plan to use.
+3. Start Neo4j, Cassandra, MongoDB, and/or Redis depending on which
+   section you plan to use.
 4. If Cassandra is running with the `PasswordAuthenticator` enabled,
    set the role name and password in `cassandra_config.py`. If it is
    running with `AllowAllAuthenticator`, set `USE_AUTH = False` there
    instead.
-5. Create a `data/` folder in the project root and place the dataset
+5. Set the Neo4j username and password in `neo4j_config.py`. Neo4j
+   requires a password change on first login, so the value there must
+   match whatever the server was set to.
+6. Create a `data/` folder in the project root and place the dataset
    files inside it.
-6. Run the application: `python main.py`
-7. Choose a database, then choose option 1 to load data before using
+7. Run the application: `python main.py`
+8. Choose a database, then choose option 1 to load data before using
    CRUD or any feature. Every other option reads from what the load
    step creates.
 
 The Cassandra keyspace and tables are created automatically on first
-connection, so no manual `cqlsh` setup is required.
+connection, so no manual `cqlsh` setup is required. The Neo4j
+constraints and indexes are likewise applied automatically before any
+data is written.
 
 ## Project Structure
 ```
 redis-github-archive/
 ├── main.py                                # Entry point, database selection menu
+│
+├── neo4j_config.py                        # Neo4j connection and constraints
+├── neo4j_data_loader.py                   # Loads dataset into the graph
+├── neo4j_crud.py                          # CRUD on commit nodes
+├── feature_neo4j_collaboration.py         # Neo4j feature 1
+├── feature_neo4j_repo_similarity.py       # Neo4j feature 2
+├── feature_neo4j_degrees_of_separation.py # Neo4j feature 3
 │
 ├── cassandra_config.py                    # Cassandra connection, keyspace, schema
 ├── cassandra_data_loader.py               # Loads dataset into Cassandra tables
@@ -91,6 +107,91 @@ redis-github-archive/
 ├── secureCassandra.py                     # Standalone SASL authentication demo
 └── requirements.txt
 ```
+
+## Neo4j Section (Part 4)
+
+### Graph Model
+```
+(:Author  {name, email})
+(:Commit  {hash, subject, message, num_files_changed})
+(:Repo    {name, watch_count})
+(:File    {path})
+(:License {name})
+
+(Author)-[:AUTHORED]->(Commit)
+(Commit)-[:IN_REPO]->(Repo)
+(Commit)-[:MODIFIED]->(File)
+(Repo)-[:LICENSED_UNDER]->(License)
+(Author)-[:CONTRIBUTED_TO {commits: n}]->(Repo)
+```
+
+The first four relationships come from the source data. `CONTRIBUTED_TO`
+is derived after loading by rolling up each author's commits per
+repository into one weighted edge. It is technically redundant, since
+the same information is reachable by walking Author to Commit to Repo,
+but every feature in this section traverses author-to-repo constantly
+and collapsing thousands of commit hops into one edge is what keeps
+those traversals cheap. It is the graph equivalent of the Cassandra
+section storing each commit in two tables.
+
+Uniqueness constraints on `Commit.hash`, `Repo.name`, `Author.name`,
+`License.name`, and `File.path` are applied **before** any data is
+written. This is not cosmetic. The loader uses `MERGE`, and without a
+constraint backing the merged property, every `MERGE` scans every node
+carrying that label. With the constraint it is an index lookup.
+
+Licenses are modeled as nodes rather than as a property on `Repo`, so
+that finding every repository sharing a license is one hop off a single
+node instead of a scan.
+
+### CRUD Operations
+Create, Read, Update, and Delete on commit nodes, keyed by hash, plus a
+case-insensitive author search.
+
+- **Create** uses `MERGE` to attach the commit to its author and repo,
+  creating either if absent, and adjusts the `CONTRIBUTED_TO` weight.
+  Existence is checked separately, because `MERGE` on an existing hash
+  would silently match and overwrite rather than report a conflict.
+- **Read** returns the commit with its author, repository, and modified
+  files in one query. The joins are the traversal.
+- **Update** validates the property name against an allowlist, since
+  property names cannot be parameterized in Cypher, the same
+  restriction CQL has on column names.
+- **Delete** uses `DETACH DELETE`. Neo4j refuses to delete a node that
+  still has relationships, so the database itself prevents the dangling
+  references that Redis and Cassandra both permitted and left to the
+  application to avoid.
+
+### Features
+1. **Collaboration patterns between authors.** Matches the shape
+   `(a1)-[:CONTRIBUTED_TO]->(r)<-[:CONTRIBUTED_TO]-(a2)` to find authors
+   who work on the same repositories, ranked by how many they share.
+   The pattern is the entire logic; there is no join to construct.
+   Can also list the closest collaborators for one named author.
+2. **Repository similarity by shared contributors.** A two hop traversal
+   out through a repository's contributors and back down into
+   everything else they touched. Scored by the Jaccard index rather than
+   raw overlap, so a large repository does not rank as similar to
+   everything simply by being large.
+3. **Degrees of separation between two authors.** Uses `shortestPath()`
+   to find the shortest chain of shared repositories linking two
+   contributors. This is the one query in the whole project that has no
+   reasonable implementation in any of the other three databases, since
+   the hop count is not known in advance and each hop depends on the
+   last. The search runs over the existing bipartite author-to-repo
+   structure rather than a materialized `COLLABORATED_WITH` edge, which
+   would need n * (n - 1) / 2 relationships per repository and add
+   millions of edges without making the graph any more expressive.
+
+### Loading
+Writes go out as `UNWIND` over a batch parameter, 2,000 rows per
+statement, so a batch is one round trip and one query plan rather than
+one of each per row. The graph is cleared with
+`CALL { ... } IN TRANSACTIONS`, which commits in chunks, because
+deleting several hundred thousand nodes in a single transaction is a
+reliable way to exhaust the heap. Files per commit are capped, since a
+handful of commits touch thousands of files and would otherwise
+dominate the node count without changing any result.
 
 ## Cassandra Section (Part 3)
 
@@ -239,50 +340,55 @@ licenses:ranked                   Sorted Set  license name -> repo count
 - The dataset contains no commit timestamps, so commit history is
   represented as activity by author rather than activity over time.
 
-## Redis vs MongoDB vs Cassandra, Observed Differences
+## Comparing All Four Databases
 
-**Data modeling.** Redis required flattening each commit into a hash
-and hand-building set and sorted-set structures for every lookup.
-MongoDB stored each JSON record close to its original shape, nested
-fields included, and added indexes afterward. Cassandra sits between
-the two but for a different reason: the row shape is flat and typed
-like a relational table, yet the same commit is deliberately stored
-twice, because a query has to be served by a partition key and there is
-no index that makes an unplanned query cheap.
+**Data modeling.** Redis required flattening each commit into a hash and
+hand-building set and sorted-set structures for every lookup. MongoDB
+stored each JSON record close to its original shape and added indexes
+afterward. Cassandra kept a flat, typed row but deliberately stored the
+same commit twice, because a query has to be served by a partition key.
+Neo4j is the outlier: the record is not self-contained at all. A commit
+is a node in the middle of relationships to an author, a repository, and
+its files, and those relationships are the data rather than pointers to
+it.
 
-**Deletes.** MongoDB is one `delete_one` call. Redis and Cassandra both
-require cleaning up every derived structure the record was written
-into, or the extra tables and indexes are left pointing at rows that no
-longer exist.
+**Deletes.** MongoDB is one call. Redis and Cassandra both required
+cleaning up every derived structure by hand, or they would be left
+holding references to records that no longer exist. Neo4j is the only
+one of the four where the database refuses to allow the inconsistency:
+deleting a node with relationships raises an error unless `DETACH
+DELETE` removes the edges too.
 
-**Analysis.** MongoDB performs grouping, bucketing, and sorting on the
-server through the aggregation pipeline. Neither Redis nor Cassandra
-has server-side aggregation, so both had to precompute counts during
-loading. The mechanism differs: Redis uses `ZINCRBY` into a sorted set,
-which keeps the results ranked, while Cassandra uses counter columns,
-which cannot be clustering columns and therefore come back unordered
-and are ranked in the application.
+**Analysis.** MongoDB is the only one that performs general aggregation
+on the server through the pipeline. Redis and Cassandra both had to
+precompute counts during loading, by different mechanisms, `ZINCRBY`
+into a sorted set for Redis and counter columns for Cassandra. Neo4j
+does its analysis at query time, but the work is proportional to how
+connected the starting node is rather than to the size of the database,
+because a traversal only ever touches what is reachable.
 
-**Sorting.** Cassandra is the only one of the three that can store rows
-physically sorted on a chosen column. The clustering order on
-`repos_by_watch_tier` means the most watched repositories in a tier
-come off disk already ordered, but that ordering only exists inside a
-partition, which is why the top-N-overall query walks the tiers from
-the highest down rather than issuing one query.
+**Sorting.** Cassandra is the only one that stores rows physically
+sorted on a chosen column, through clustering order, though that
+ordering exists only inside a partition.
 
-**Consistency.** Redis and MongoDB were used with defaults. Cassandra
-makes consistency a per-query decision, so the read-only report queries
-run at `ONE` and the CRUD delete runs at `QUORUM`.
+**Queries the others cannot answer.** Each part surfaced one. MongoDB's
+regex author search had no Cassandra equivalent without a table built
+for it in advance. Cassandra's per-query consistency level has no
+counterpart anywhere else. Neo4j's shortest path between two
+contributors has no reasonable implementation in any of the other three,
+since the number of hops is unknown in advance and each one depends on
+the results of the last.
 
 **Writes.** Cassandra `INSERT` is an upsert, so creating a record that
-must not already exist needs `IF NOT EXISTS` and the Paxos round trip
-that comes with it. MongoDB rejects a duplicate `_id` outright, and
-Redis needed an explicit existence check.
+must not already exist needs `IF NOT EXISTS` and a Paxos round trip.
+MongoDB rejects a duplicate `_id` outright. Redis and Neo4j both needed
+an explicit existence check, Neo4j because `MERGE` would otherwise match
+the existing node and overwrite it.
 
 ## Next Steps
 - Add a cross-database comparison view that runs the same query against
-  all three databases and reports response times.
-- Add commit search filtered by repository across all three sections.
+  all four databases and reports response times.
+- Add commit search filtered by repository across all four sections.
 - Strengthen input validation on the CRUD menus, particularly commit
   hashes entered with inconsistent capitalization or surrounding
   whitespace.
