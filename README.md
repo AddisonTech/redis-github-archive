@@ -1,7 +1,7 @@
 # GitHub Archive Database Integration
 
-A Python application that loads real GitHub Archive data into a NoSQL
-database and performs CRUD operations and analysis on it.
+A Python application that loads real GitHub Archive data into a database
+and performs CRUD operations and analysis on it.
 
 The project is built in parts, one database per part:
 
@@ -11,13 +11,16 @@ The project is built in parts, one database per part:
 | 2 | **MongoDB** | Document store |
 | 3 | **Cassandra** | Column-family store |
 | 4 | **Neo4j** | Graph store |
+| 5 | **SQLite** | Relational store |
 
-All four implementations live in the same project so the same
-application can be run against each one and the four data models
-compared side by side.
+All five implementations live in the same project so the same
+application can be run against each one and the five data models
+compared side by side. The first four are NoSQL; the fifth is
+relational, which is what makes the comparison worth making.
 
 ## Dependencies
 - Python 3.10 or later
+- SQLite (no installation needed, `sqlite3` ships with Python)
 - Neo4j server (for the Neo4j section)
 - Cassandra node (for the Cassandra section)
 - MongoDB server (for the MongoDB section)
@@ -35,6 +38,8 @@ pip install -r requirements.txt
 ```
 
 ## Technology Requirements
+- No server required for the SQLite section. The database is a single
+  file, `github_archive.db`, created in the project root on first use.
 - A running Neo4j server on bolt://localhost:7687
 - A running Cassandra node on 127.0.0.1:9042
 - A running MongoDB instance on localhost:27017
@@ -51,7 +56,7 @@ limits. The `data/` folder is listed in `.gitignore`.
 1. Clone this repository.
 2. Install dependencies: `pip install -r requirements.txt`
 3. Start Neo4j, Cassandra, MongoDB, and/or Redis depending on which
-   section you plan to use.
+   section you plan to use. The SQLite section needs nothing started.
 4. If Cassandra is running with the `PasswordAuthenticator` enabled,
    set the role name and password in `cassandra_config.py`. If it is
    running with `AllowAllAuthenticator`, set `USE_AUTH = False` there
@@ -75,6 +80,13 @@ data is written.
 ```
 redis-github-archive/
 ├── main.py                                # Entry point, database selection menu
+│
+├── sqlite_config.py                       # SQLite connection and schema
+├── sqlite_data_loader.py                  # Loads dataset into SQLite tables
+├── sqlite_crud.py                         # CRUD on commit rows
+├── feature_sqlite_file_activity.py        # SQLite feature 1
+├── feature_sqlite_committers.py           # SQLite feature 2
+├── feature_sqlite_contributor_ranking.py  # SQLite feature 3
 │
 ├── neo4j_config.py                        # Neo4j connection and constraints
 ├── neo4j_data_loader.py                   # Loads dataset into the graph
@@ -107,6 +119,110 @@ redis-github-archive/
 ├── secureCassandra.py                     # Standalone SASL authentication demo
 └── requirements.txt
 ```
+
+## SQLite Section (Part 5)
+
+SQLite is the only relational database in this project and the only one
+of the five that needs no server. There is no host, no port, and no
+credentials, because the database is a single file and the library runs
+inside the application process.
+
+### Schema
+```
+licenses      license_id PK, name UNIQUE
+authors       author_id PK, name UNIQUE, email
+repos         repo_id PK, repo_name UNIQUE, watch_count,
+              license_id FK -> licenses ON DELETE SET NULL
+commits       commit_hash PK, repo_id FK -> repos ON DELETE CASCADE,
+              author_id FK -> authors ON DELETE CASCADE,
+              subject, message, num_files_changed
+commit_files  file_id PK, commit_hash FK -> commits ON DELETE CASCADE,
+              file_path
+```
+
+This is a normalized schema: each fact is stored once and referenced by
+foreign key everywhere else. Every earlier part had to denormalize in
+some form. Redis hand-built parallel index structures, Cassandra wrote
+the same commit into two tables, Neo4j derived a redundant relationship
+to keep traversals cheap, and MongoDB embedded values a relational
+schema would point at. None of that is needed here, because the join
+happens at query time rather than being designed around in advance.
+
+Note that SQLite ships with foreign key enforcement **off** by default
+for backward compatibility. The `PRAGMA foreign_keys = ON` in
+`sqlite_config.py` is what turns the declarations above into rules
+rather than documentation, and it must be set per connection.
+
+Indexes are created on every foreign key column and on `watch_count`.
+SQLite indexes PRIMARY KEY and UNIQUE columns automatically but not
+REFERENCES columns, and every feature joins on those.
+
+### CRUD Operations
+Create, Read, Update, and Delete on commit rows, keyed by hash, plus a
+case-insensitive author search.
+
+- **Create** runs in a transaction across three tables, since the author
+  and repo rows must exist first. If the commit insert fails, the
+  rollback removes the author and repo rows too. A real multi-table
+  rollback is something none of the four NoSQL parts offered; the
+  closest was Cassandra's logged batch, which guarantees eventual
+  application but gives no isolation.
+- **Read** joins commits, authors, repos, and licenses in one statement.
+- **Update** validates the column against an allowlist, since column
+  names cannot be parameterized, then uses `rowcount` to report whether
+  the row existed without a separate read first.
+- **Delete** relies on `ON DELETE CASCADE`. Removing a commit removes
+  its file rows inside the database. Redis and Cassandra both required
+  the application to do this by hand and would leave orphans if it
+  forgot; Neo4j refused the delete until relationships were removed
+  manually. SQLite is the only one of the five that quietly does the
+  right thing.
+
+Every query is parameterized with `?` placeholders.
+
+### Features
+1. **File activity in the most watched repositories.** A four-table join
+   across `commit_files`, `commits`, `repos`, and `licenses`. Reports
+   commits, distinct files touched, total file changes, and average
+   files per commit per repository. `COUNT(DISTINCT file_path)` and
+   `COUNT(file_id)` answer two different questions from one join: how
+   much of the codebase was touched versus how much churn there was.
+   A second query uses `HAVING` to find the most frequently changed
+   individual files, filtering on the aggregate in a way `WHERE` cannot.
+2. **Committers per repository.** Aggregates an aggregate: the average
+   number of committers per repository is the mean of a count, which
+   cannot be produced by a single `GROUP BY`. Common table expressions
+   name the intermediate result so the outer query can average it. Also
+   produces a distribution histogram with `CASE` and a commits-per-person
+   ratio, and renders a matplotlib chart.
+3. **Top contributors ranked within each repository.** Uses window
+   functions. `ROW_NUMBER() OVER (PARTITION BY repo_id ORDER BY commits
+   DESC)` ranks contributors inside each repository without collapsing
+   the rows, so the top three for *every* repository come back in one
+   query rather than one query per repository. `SUM(...) OVER
+   (PARTITION BY ...)` puts each repository's total on every row, making
+   the percentage share possible without a self join. A second report
+   measures contribution concentration: what share of a repository's
+   commits came from its single most active contributor.
+
+### Loading
+The load runs parents first, since a commit row carries foreign keys
+that must already exist. `Sample_Commits.json` is read in two passes,
+the first collecting distinct authors and repositories and the second
+inserting the commits. Two passes is slower than one, but the
+alternative is a lookup query per record, and reading the file twice is
+cheaper than that.
+
+Three things keep inserts fast. `executemany` inside a single
+transaction per batch, because SQLite syncs to disk at the end of every
+transaction and autocommit would mean one sync per row. Relaxed
+`journal_mode` and `synchronous` PRAGMAs during the bulk load, restored
+afterward, trading crash durability for speed on an operation that can
+simply be re-run. And id lookups cached in Python dictionaries rather
+than queried per row.
+
+`ANALYZE` runs after loading. It collects statistics the query planner
+uses to choose join order, and without it the planner guesses.
 
 ## Neo4j Section (Part 4)
 
@@ -340,44 +456,52 @@ licenses:ranked                   Sorted Set  license name -> repo count
 - The dataset contains no commit timestamps, so commit history is
   represented as activity by author rather than activity over time.
 
-## Comparing All Four Databases
+## Comparing All Five Databases
+
+The point of building the same application five times is that each
+database makes a different set of things easy and a different set hard.
+Where they differ:
 
 **Data modeling.** Redis required flattening each commit into a hash and
 hand-building set and sorted-set structures for every lookup. MongoDB
 stored each JSON record close to its original shape and added indexes
 afterward. Cassandra kept a flat, typed row but deliberately stored the
 same commit twice, because a query has to be served by a partition key.
-Neo4j is the outlier: the record is not self-contained at all. A commit
-is a node in the middle of relationships to an author, a repository, and
-its files, and those relationships are the data rather than pointers to
-it.
+Neo4j made the relationships themselves the data rather than pointers to
+it. SQLite is the only one that stores each fact exactly once, because
+it is the only one that can assemble a result from several tables at
+query time instead of at load time.
 
-**Deletes.** MongoDB is one call. Redis and Cassandra both required
-cleaning up every derived structure by hand, or they would be left
-holding references to records that no longer exist. Neo4j is the only
-one of the four where the database refuses to allow the inconsistency:
-deleting a node with relationships raises an error unless `DETACH
-DELETE` removes the edges too.
+**Denormalization.** Four of the five required it, in four different
+forms: parallel index structures in Redis, duplicated tables in
+Cassandra, a derived relationship in Neo4j, and embedded values in
+MongoDB. Only the relational schema avoided it entirely. That is the
+clearest single result of the whole project.
 
-**Analysis.** MongoDB is the only one that performs general aggregation
-on the server through the pipeline. Redis and Cassandra both had to
-precompute counts during loading, by different mechanisms, `ZINCRBY`
-into a sorted set for Redis and counter columns for Cassandra. Neo4j
-does its analysis at query time, but the work is proportional to how
-connected the starting node is rather than to the size of the database,
-because a traversal only ever touches what is reachable.
+**Deletes.** Redis and Cassandra both required the application to clean
+up every derived structure by hand and would silently leave orphans if
+it forgot. Neo4j refused the delete outright until the relationships
+were removed. SQLite removes dependent rows automatically through
+`ON DELETE CASCADE`. MongoDB never had the problem, since the record was
+self-contained to begin with.
+
+**Analysis.** Redis and Cassandra had to precompute counts at write
+time, by `ZINCRBY` and counter columns respectively. MongoDB aggregates
+on the server but only within a single collection. Neo4j aggregates
+during traversal, with cost proportional to how connected the starting
+node is. SQLite composes aggregates freely: common table expressions
+name intermediate results, `HAVING` filters on aggregates, and window
+functions rank rows without collapsing them.
 
 **Sorting.** Cassandra is the only one that stores rows physically
 sorted on a chosen column, through clustering order, though that
 ordering exists only inside a partition.
 
-**Queries the others cannot answer.** Each part surfaced one. MongoDB's
-regex author search had no Cassandra equivalent without a table built
-for it in advance. Cassandra's per-query consistency level has no
-counterpart anywhere else. Neo4j's shortest path between two
-contributors has no reasonable implementation in any of the other three,
-since the number of hops is unknown in advance and each one depends on
-the results of the last.
+**Transactions.** Only SQLite offers a real multi-statement rollback
+across several tables. Cassandra's logged batch guarantees eventual
+application without isolation, and its lightweight transaction covers a
+single partition. Redis, MongoDB, and Neo4j were each used with
+single-operation writes in this project.
 
 **Writes.** Cassandra `INSERT` is an upsert, so creating a record that
 must not already exist needs `IF NOT EXISTS` and a Paxos round trip.
@@ -385,10 +509,35 @@ MongoDB rejects a duplicate `_id` outright. Redis and Neo4j both needed
 an explicit existence check, Neo4j because `MERGE` would otherwise match
 the existing node and overwrite it.
 
+**Setup cost.** Four of the five needed a server running, and three of
+those needed credentials configured before a single row could be read.
+SQLite needed a writable folder.
+
+**Queries only one of them can answer.** Each part surfaced one. Redis
+could rank by score with no query language at all. MongoDB's regex
+author search had no Cassandra equivalent without a table built for it
+in advance. Cassandra's per-query consistency level has no counterpart
+anywhere else. Neo4j's shortest path between two contributors has no
+reasonable implementation in the other four, since the hop count is
+unknown in advance. SQLite's per-group top-N in a single pass is
+impractical everywhere else: `GROUP BY` alone collapses each group to
+one row, and only a window function ranks within a group while leaving
+the rows intact.
+
 ## Next Steps
-- Add a cross-database comparison view that runs the same query against
-  all four databases and reports response times.
-- Add commit search filtered by repository across all four sections.
+The five database integrations that the project set out to build are
+complete. If development continued, the following are the next items:
+
+- Add a cross-database comparison view that runs the same logical query
+  against all five databases and reports response times side by side.
+  With five implementations finished there is finally enough variety for
+  that measurement to say something.
+- Add commit search filtered by repository across all five sections, so
+  the same capability exists everywhere rather than in some sections
+  only.
 - Strengthen input validation on the CRUD menus, particularly commit
   hashes entered with inconsistent capitalization or surrounding
   whitespace.
+- Offer a choice between reloading and appending at load time. Every
+  loader currently clears its data first, which keeps loads repeatable
+  but discards records created through the CRUD menus.

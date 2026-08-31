@@ -220,6 +220,7 @@ __marimo__/
 # Dataset JSON files, several hundred MB. Never commit these.
 data/
 
-# Project archive snapshot and assignment brief, not part of the source
-redis-github-archive.zip
-*.docx
+# SQLite database file, rebuilt from the dataset by the loader.
+*.db
+*.db-wal
+*.db-shm

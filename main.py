@@ -3,18 +3,21 @@ main.py
 
 Entry point for the GitHub Archive database application.
 
-The project now supports four NoSQL databases, one per part of the
-course project:
+The project supports five databases, one per part of the course
+project:
 
-    Part 1  Redis      key-value store
-    Part 2  MongoDB    document store
-    Part 3  Cassandra  column-family store
-    Part 4  Neo4j      graph store
+    Part 1  Redis      key-value store       (NoSQL)
+    Part 2  MongoDB    document store        (NoSQL)
+    Part 3  Cassandra  column-family store   (NoSQL)
+    Part 4  Neo4j      graph store           (NoSQL)
+    Part 5  SQLite     relational store      (SQL)
 
-All four implementations are kept in the same project rather than
+All five implementations are kept in the same project rather than
 replaced, so the same application can be run against each one and the
-differences between the four data models can be compared directly.
-That comparison is the point of building the application four times.
+differences between the five data models can be compared directly.
+That comparison is the point of building the application five times,
+and the final part is the only relational one, which is what makes the
+comparison worth making.
 
 Run with: python main.py
 """
@@ -22,6 +25,7 @@ Run with: python main.py
 import cassandra_config
 import mongo_config
 import neo4j_config
+import sqlite_config
 
 # Redis modules from part 1
 from data_loader import load_all_data as load_redis_data
@@ -59,6 +63,47 @@ from feature_neo4j_repo_similarity import (print_similarity_report,
                                            list_repos_with_contributors)
 from feature_neo4j_degrees_of_separation import (print_path_report,
                                                  list_sample_authors)
+
+# SQLite modules from part 5
+from sqlite_data_loader import load_all_data as load_sqlite_data
+from sqlite_crud import run_crud_menu as run_sqlite_crud
+from feature_sqlite_file_activity import print_file_activity_report
+from feature_sqlite_committers import print_committer_report
+from feature_sqlite_contributor_ranking import print_ranking_report
+
+
+def sqlite_menu():
+    """SQLite section of the application, added in part 5."""
+    if not sqlite_config.check_connection():
+        print("\nCould not open the SQLite database file. Check that the "
+              "project folder is writable.")
+        return
+
+    while True:
+        print("\n--- SQLite ---")
+        print("1. Load data into SQLite")
+        print("2. CRUD operations")
+        print("3. Feature: File activity in the most watched repos")
+        print("4. Feature: Committers per repository")
+        print("5. Feature: Top contributors ranked within each repo")
+        print("6. Back to main menu")
+
+        choice = input("Choose an option: ").strip()
+
+        if choice == "1":
+            load_sqlite_data("data")
+        elif choice == "2":
+            run_sqlite_crud()
+        elif choice == "3":
+            print_file_activity_report()
+        elif choice == "4":
+            print_committer_report()
+        elif choice == "5":
+            print_ranking_report()
+        elif choice == "6":
+            break
+        else:
+            print("Not a valid option, try again.")
 
 
 def neo4j_menu():
@@ -236,23 +281,26 @@ def main():
 
     while True:
         print("\nSelect a database:")
-        print("1. Neo4j")
-        print("2. Cassandra")
-        print("3. MongoDB")
-        print("4. Redis")
-        print("5. Quit")
+        print("1. SQLite")
+        print("2. Neo4j")
+        print("3. Cassandra")
+        print("4. MongoDB")
+        print("5. Redis")
+        print("6. Quit")
 
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
-            neo4j_menu()
+            sqlite_menu()
         elif choice == "2":
-            cassandra_menu()
+            neo4j_menu()
         elif choice == "3":
-            mongo_menu()
+            cassandra_menu()
         elif choice == "4":
-            redis_menu()
+            mongo_menu()
         elif choice == "5":
+            redis_menu()
+        elif choice == "6":
             # Close the Cassandra and Neo4j connections if either was
             # opened. Both drivers run background threads that keep the
             # process alive otherwise.
